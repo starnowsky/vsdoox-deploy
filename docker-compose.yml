@@ -1,6 +1,6 @@
 services:
   vsdoox:
-    build: .
+    image: ghcr.io/starnowsky/vsdoox:latest
     container_name: vsdoox
     ports:
       - "${PORT:-5000}:${PORT:-5000}"
