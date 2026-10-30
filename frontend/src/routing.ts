@@ -31,6 +31,12 @@ export const MAX_CONN_DIST = 300;
 // Константа толщины линии (в пикселях) - используется для зазора между параллельными линиями и радиуса мостиков
 export const LINE_WIDTH = 2;
 
+// Настраиваемый отступ между параллельными линиями одного коридора (в пикселях).
+// Может быть переопределён через параметр spacing routeConnections — по умолчанию
+// используется эта константа. 12 px ≈ 5–6 толщин линии, достаточно чтобы линии не
+// сливались визуально, но не так много, чтобы раздувать схему.
+export const EDGE_SPACING = 12;
+
 // Find nearest point on rectangle boundary to a target point.
 // Returns the point on the closest side (top/right/bottom/left) — the clamped
 // projection of the target onto that side — so lines terminate at the nearest
@@ -146,24 +152,26 @@ function getDistributedPoint(
   return { x: v, y: fixedY };
 }
 
-const GAP = LINE_WIDTH * 5; // отступ = 5 толщин линии (адаптивный)
 const R = LINE_WIDTH * 2; // радиус «мостика» на пересечении
 
-function orthoPath(source: Pt, waypoints: Pt[], target: Pt, lane = 0): Pt[] {
-  // Линия выходит из источника и заканчивается «по горизонтали» — входим в цель
-  // перпендикулярно боковой стороне (последний сегмент горизонтальный), выходя
-  // из источника тоже горизонтально. Между соседними точками — Z-образный переход
-  // через середину по X, без вертикального «скольжения» вдоль границе узла.
-  // `lane` смещает вертикальный изгиб по горизонтали, чтобы изгибы параллельных
-  // линий между одной парой узлов не накладывались друг на друга. Конечные точки
-  // остаются приклеенными к граням исходного и целевого узлов.
+// Ортогональный путь source..target с вертикальными и горизонтальными сегментами.
+// - `lane` сдвигает внутренний вертикальный изгиб ( середина по X ) по горизонтали,
+//   чтобы изгибы параллельных линий не накладывались.
+// - Конечные точки (source, target) остаются приклеенными к портам/анкорам узлов.
+// - Если источник и цель лежат на одной вертикали (source.x === target.x), путь
+  // не заламывается в точку цели, а делает U-джог наружу: short horizontal step,
+// vertical, short horizontal step. Это даёт отдельный вертикальный коридор для
+// каждой линии, который затем разводится separateLanes.
+export function orthoPath(source: Pt, waypoints: Pt[], target: Pt, lane = 0): Pt[] {
   const pts: Pt[] = [source, ...waypoints, target];
   const path: Pt[] = [{ x: pts[0].x, y: pts[0].y }];
   for (let i = 1; i < pts.length; i++) {
     const a = path[path.length - 1];
     const b = pts[i];
     if (a.x === b.x) {
-      // Точки на одной вертикали — чистый вертикальный сегмент.
+      // Чисто вертикальный переход. Не патчим сразу: для чисто вертикального всего
+      // пути (source.x === target.x) вертикальный сегмент будет разведён позже
+      // через separateLanes (U-образный джог добавит горизонтальные кронштейны).
       if (a.y !== b.y) path.push({ x: b.x, y: b.y });
     } else {
       const midX = (a.x + b.x) / 2 + lane;
@@ -175,32 +183,34 @@ function orthoPath(source: Pt, waypoints: Pt[], target: Pt, lane = 0): Pt[] {
   return path;
 }
 
-function shiftPath(path: Pt[], d: number): Pt[] {
-  if (!d) return path;
-  const a = path[0];
-  const b = path[path.length - 1];
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const len = Math.hypot(dx, dy) || 1;
-  const px = -dy / len;
-  const py = dx / len;
-  return path.map((p) => ({ x: p.x + px * d, y: p.y + py * d }));
-}
 
-function bendCorridorKey(it: RouteItem): string {
-  // Коридор вертикального изгиба — середина по X между точками подключения.
-  // Линии с одинаковым коридором разводятся по горизонтали, чтобы их
-  // вертикальные изгибы не накладывались, независимо от пары объектов.
-  // Округление до 0.5px — защита от шума плавающей точки.
-  const midX = (it.source.x + it.target.x) / 2;
-  return String(Math.round(midX * 2));
-}
 
-interface Seg {
+// Сегмент ортогонального пути. Построен для выявления совпадающих (коллинеарных)
+// коридоров и разведения параллельных линий.
+export interface Seg {
   edgeIndex: number;
   segIndex: number;
   a: Pt;
   b: Pt;
+  orientation: 'h' | 'v'; // 'h' — горизонтальный (a.y === b.y), 'v' — вертикальный
+  fixed: number;          // константная координата: Y для 'h', X для 'v'
+  lo: number;             // минимум по вертикальной оси
+  hi: number;             // максимум по вертикальной оси
+}
+
+function makeSeg(edgeIndex: number, segIndex: number, a: Pt, b: Pt): Seg {
+  const horizontal = a.y === b.y;
+  const orientation = horizontal ? 'h' : 'v';
+  return {
+    edgeIndex,
+    segIndex,
+    a,
+    b,
+    orientation,
+    fixed: horizontal ? a.y : a.x,
+    lo: horizontal ? Math.min(a.x, b.x) : Math.min(a.y, b.y),
+    hi: horizontal ? Math.max(a.x, b.x) : Math.max(a.y, b.y),
+  };
 }
 
 function crossing(s1: Seg, s2: Seg): Pt | null {
@@ -395,7 +405,7 @@ export function routeConnections(
     );
     const n = sorted.length;
     sorted.forEach((lineIdx, j) => {
-      laneMap.set(`${lineIdx}:${fwId}`, (j - (n - 1) / 2) * GAP);
+      laneMap.set(`${lineIdx}:${fwId}`, (j - (n - 1) / 2) * EDGE_SPACING);
     });
   }
 
@@ -409,32 +419,60 @@ export function routeConnections(
     });
   });
 
-  // Вертикальные изгибы линий, у которых изгиб попадает в один коридор (одна и
-  // та же середина по X между источником и целью), разводятся по горизонтали,
-  // чтобы не накладываться друг на друга — вне зависимости от пары объектов.
-  const bendLane = new Array(distributedItems.length).fill(0);
-  const bendGroups = new Map<string, number[]>();
-  distributedItems.forEach((it, i) => {
-    const key = bendCorridorKey(it);
-    if (!bendGroups.has(key)) bendGroups.set(key, []);
-    bendGroups.get(key)!.push(i);
-  });
-  for (const lines of bendGroups.values()) {
-    const n = lines.length;
-    lines.forEach((idx, j) => {
-      bendLane[idx] = (j - (n - 1) / 2) * GAP;
-    });
-  }
-
-  const paths = distributedItems.map((it, i) =>
-    orthoPath(it.source, adjusted[i], it.target, bendLane[i])
+  // ---- LANE SEPARATION: разводят параллельные линии одного коридора ----
+  // Строим базовые пути (без разведения), затем ищем сегменты, лежащие на одной
+  // прямой (совпадающий коридор), группируем их в связные «пучки» и сдвигаем
+  // каждый член пучка на фиксированный перпендикулярный отступ. Порты (source,
+  // target) не трогаем — смещение применяется только к промежуточным точкам излома.
+  // Смещение стабильно: порядок полос задаётся пространственной координатой якоря
+  // с тай-брейком по индексу ребра, а sign определяется направлением потока,
+  // поэтому при перетаскивании/перерисовке полосы не «прыгают».
+  const spacing = EDGE_SPACING;
+  const basePaths = distributedItems.map((it, i) =>
+    orthoPath(it.source, adjusted[i], it.target, bendCorridor(it))
   );
 
-  // Сегменты всех линий — для поиска пересечений.
+  const laneOffsets = separateLanes(basePaths, spacing);
+
+  // Применяем вычисленные смещения, сохраняя ортогональность и не трогая порты.
+  // Смещение считается по X (вертикальные пучки разводятся горизонтально);
+  // горизонтальные параллельные линии уже разводятся через тангенциальное
+  // распределение точек подключения (getDistributedPoint).
+  //
+  // - Чисто вертикальная связь (source.x === target.x, один вертикальный сегмент):
+  //   разводим U-образно — два горизонтальных кронштейна у портов + вертикаль между ними.
+  //   Порты остаются привязаны к узлам.
+  // - Z-образный путь (source → изгиб → цель): сдвигаем все ВНУТРЕННИЕ точки излома
+  //   по X на off — вертикальный изгиб уходит в свою полосу, а горизонтальные
+  //   сегменты к портам остаются ортогональными.
+  const paths = basePaths.map((path, i) => {
+    const off = laneOffsets.get(i) ?? 0;
+    if (!off) return path;
+    const sign = off > 0 ? 1 : -1;
+    const dx = Math.abs(off);
+    const p0 = path[0];
+    const pLast = path[path.length - 1];
+    // Чисто вертикальная связь — U-джог.
+    if (path.length === 2 && p0.x === pLast.x) {
+      return [
+        p0,
+        { x: p0.x + sign * dx, y: p0.y },
+        { x: pLast.x + sign * dx, y: pLast.y },
+        pLast,
+      ];
+    }
+    // Z-образный путь — сдвигаем внутренние точки излома по X.
+    return path.map((p, k) => {
+      if (k === 0 || k === path.length - 1) return p;
+      return { x: p.x + sign * dx, y: p.y };
+    });
+  });
+
+  // Сегменты всех разведённых линий — для поиска пересечений (мостиков).
   const segs: Seg[] = [];
   paths.forEach((path, edgeIndex) => {
     for (let segIndex = 0; segIndex < path.length - 1; segIndex++) {
-      segs.push({ edgeIndex, segIndex, a: path[segIndex], b: path[segIndex + 1] });
+      segs.push(makeSeg(edgeIndex, segIndex, path[segIndex], path[segIndex + 1]));
     }
   });
 
@@ -459,18 +497,146 @@ export function routeConnections(
   }));
 }
 
+// Коридор вертикального изгиба линии — середина по X между источником и целью.
+// Линии с одинаковым коридором получат разные лейны. Округление до 0.5px — защита
+// от шума плавающей точки.
+function bendCorridor(it: RouteItem): number {
+  return Math.round(((it.source.x + it.target.x) / 2) * 2);
+}
+
+// Направление потока линии по общему вектору source→target: +1 (вниз/вправо) или -1.
+// Используется, чтобы знаки смещений у параллельных линий согласовывались и не
+// перекручивались при отрисовке.
+function flowDirection(seg: Seg, paths: Pt[][]): 1 | -1 {
+  const path = paths[seg.edgeIndex];
+  if (path.length < 2) return 1;
+  const p0 = path[0];
+  const pLast = path[path.length - 1];
+  const dx = pLast.x - p0.x;
+  const dy = pLast.y - p0.y;
+  if (seg.orientation === 'v') return dy >= 0 ? 1 : -1;
+  return dx >= 0 ? 1 : -1;
+}
+
+// Находит совпадающие коллинеарные сегменты (общий коридор) и возвращает
+// смещение (в пикселях) для каждого ребра.
+//
+// Группировка:
+//   1. Ключ коридора = ориентация + фиксированная координата, округлённая до 0.5px.
+//      Сегменты одной прямой попадают в один ключ.
+//   2. Внутри ключа сегменты сортируются по интервалу [lo, hi] вдоль оси.
+//   3. Транзитивное замыкание по пересечению интервалов → «пучок» (bundle).
+//      Внутри пучка линии идут параллельно по совпадающему участку — их и разводим.
+//   4. Внутри пучка порядок полос стабилен: сортировка по перпендикулярной
+//      координате якоря (для вертикальных — y верхнего конца, для горизонтальных —
+//      x левого конца), тай-брейк по индексу ребра. Знак смещения корректируется
+//      направлением потока (dx/dy), чтобы параллельные линии не перекрещивались.
+//   5. Смещение члена пучка с индексом j из n: (j - (n-1)/2) * spacing.
+//
+// Порты (source/target) не смещаются: applyLaneOffsets сдвигает только внутренние
+// точки излома.
+export function separateLanes(
+  paths: Pt[][],
+  spacing: number = EDGE_SPACING
+): Map<number, number> {
+  const offsets = new Map<number, number>();
+  if (spacing <= 0) return offsets;
+
+  // --- 1. Коридоры: ключ → список сегментов ---------------------------------
+  const keyOf = (s: Seg): string => `${s.orientation}:${Math.round(s.fixed * 2)}`;
+  const corridors = new Map<string, Seg[]>();
+  paths.forEach((path, edgeIndex) => {
+    for (let segIndex = 0; segIndex < path.length - 1; segIndex++) {
+      const s = makeSeg(edgeIndex, segIndex, path[segIndex], path[segIndex + 1]);
+      // Разводим только ВЕРТИКАЛЬНЫЕ сегменты (коридоры «вверх/вниз»).
+      // Горизонтальные параллельные линии уже разводятся через тангенциальное
+      // распределение точек подключения (getDistributedPoint).
+      if (s.orientation !== 'v') continue;
+      const key = keyOf(s);
+      if (!corridors.has(key)) corridors.set(key, []);
+      corridors.get(key)!.push(s);
+    }
+  });
+
+  // --- 2. Пучки (связные компоненты по пересечению интервалов) --------------
+  for (const segments of corridors.values()) {
+    // Сортируем по началу интервала для детерминированного обхода.
+    segments.sort(
+      (a, b) => a.lo - b.lo || a.hi - b.hi || a.edgeIndex - b.edgeIndex
+    );
+
+    const n = segments.length;
+    const compId = new Array(n).fill(-1);
+    let compCount = 0;
+    for (let i = 0; i < n; i++) {
+      if (compId[i] !== -1) continue;
+      const stack = [i];
+      compId[i] = compCount;
+      while (stack.length) {
+        const u = stack.pop()!;
+        const su = segments[u];
+        for (let v = 0; v < n; v++) {
+          if (compId[v] !== -1) continue;
+          const sv = segments[v];
+          // Пересечение интервалов (более чем в одну точку).
+          if (Math.max(su.lo, sv.lo) < Math.min(su.hi, sv.hi)) {
+            compId[v] = compCount;
+            stack.push(v);
+          }
+        }
+      }
+      compCount++;
+    }
+
+    // --- 3. Внутри каждого пучка ставим лейны -------------------------------
+    const bundles = new Map<number, number[]>();
+    for (let i = 0; i < n; i++) {
+      const c = compId[i];
+      if (!bundles.has(c)) bundles.set(c, []);
+      bundles.get(c)!.push(i);
+    }
+
+    for (const members of bundles.values()) {
+      if (members.length <= 1) continue;
+
+      // Все сегменты в коридоре вертикальные — сортируем по y верхнего конца
+      // (lo), тай-брейк по индексу ребра для детерминизма.
+      members.sort((a, b) => {
+        const sa = segments[a];
+        const sb = segments[b];
+        return sa.lo - sb.lo || a - b;
+      });
+
+      const m = members.length;
+      const dir = flowDirection(segments[members[0]], paths);
+      members.forEach((posIdx, j) => {
+        const seg = segments[posIdx];
+        const lane = (j - (m - 1) / 2) * spacing * dir;
+        const cur = offsets.get(seg.edgeIndex);
+        // Записываем смещение, если для ребра ещё не было ни одного, либо новое
+        // смещение больше по модулю (центральный/основной коридор побеждает).
+        if (cur === undefined || Math.abs(lane) > Math.abs(cur)) {
+          offsets.set(seg.edgeIndex, lane);
+        }
+      });
+    }
+  }
+  return offsets;
+}
+
 // Force inclusion in bundle (prevents tree-shaking of routing functions)
 export const ROUTING_SYMBOLS = {
   routeConnections,
   nearestBoundaryPoint,
   HANDLE_GAP,
+  EDGE_SPACING,
   getDistributedPoint,
   orthoPath,
-  shiftPath,
   crossing,
   buildPath,
   midpointAlongPath,
-  bendCorridorKey,
+  separateLanes,
+  makeSeg,
   getLineWidthForConnection,
   LINE_WIDTH,
   MIN_CONN_DIST,

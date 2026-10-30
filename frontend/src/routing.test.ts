@@ -2,6 +2,33 @@ import { describe, it, expect, vi } from 'vitest';
 import { routeConnections } from './routing';
 import type { RouteItem } from './routing';
 
+// Разбирает SVG-путь (строится buildPath в routing.ts) на точки-вершины сегментов.
+// Команды M/L задают точки; команда A (мостик) имеет форму
+//   A rx ry x-axis-rotation large-arc-flag sweep-flag x y
+// где только последние два числа — координата конечной точки дуги.
+// Функция игнорирует остальные параметры дуги и не ложит их в список точек.
+function parsePathPts(d: string): { x: number; y: number }[] {
+  const tokens = d.match(/[MLA]\s*[^MLA]*/g) ?? [];
+  const pts: { x: number; y: number }[] = [];
+  for (const tok of tokens) {
+    const kind = tok[0];
+    const nums = tok.slice(1).match(/-?\d+(?:\.\d+)?/g)!.map(Number);
+    if (kind === 'M' || kind === 'L') {
+      // М/L идут парами координат.
+      for (let k = 0; k + 1 < nums.length; k += 2) {
+        pts.push({ x: nums[k], y: nums[k + 1] });
+      }
+    } else if (kind === 'A') {
+      // A: rx ry rot lf sf x y — конечная точка — последние два числа.
+      if (nums.length >= 7) {
+        pts.push({ x: nums[nums.length - 2], y: nums[nums.length - 1] });
+      }
+    }
+  }
+  return pts;
+}
+
+
 // vi.hmmodule('orthoroute') не нужен — мокируем прямо через vi.doMock,
 // но vitest не поддерживает partial mock легко, поэтому мокаем модуль целиком.
 
@@ -49,11 +76,7 @@ describe('routing — fallback when router returns no path', () => {
 
     // Разбираем SVG-путь на точки и проверяем, что каждый сегмент
     // горизонтальный или вертикальный (один из осей совпадает).
-    const nums = result[0].d.match(/-?\d+(?:\.\d+)?/g)!.map(Number);
-    const pts: { x: number; y: number }[] = [];
-    for (let k = 0; k < nums.length; k += 2) {
-      pts.push({ x: nums[k], y: nums[k + 1] });
-    }
+    const pts = parsePathPts(result[0].d);
     expect(pts.length).toBeGreaterThanOrEqual(2);
     for (let i = 1; i < pts.length; i++) {
       expect(
@@ -71,11 +94,7 @@ describe('routing — fallback when router returns no path', () => {
     expect(result.length).toBe(2);
     expect(result.every((r) => r.d.startsWith('M'))).toBe(true);
     for (const r of result) {
-      const nums = r.d.match(/-?\d+(?:\.\d+)?/g)!.map(Number);
-      const pts: { x: number; y: number }[] = [];
-      for (let k = 0; k < nums.length; k += 2) {
-        pts.push({ x: nums[k], y: nums[k + 1] });
-      }
+      const pts = parsePathPts(r.d);
       for (let i = 1; i < pts.length; i++) {
         expect(
           pts[i].x === pts[i - 1].x || pts[i].y === pts[i - 1].y,
